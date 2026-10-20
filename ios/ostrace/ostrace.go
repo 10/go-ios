@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,8 +68,10 @@ const (
 // multi-bit combos: no bit or combo separates Info from Debug. Clients
 // wanting only one must filter client-side.
 const (
-	StreamFlagsDebug uint32 = 0x20 // triggers mode=0xb → enables Info+Debug together
-	StreamFlagsAll   uint32 = StreamFlagsDebug
+	StreamFlagsPayload    uint32 = 0x04 // OS_ACTIVITY_STREAM_PAYLOAD
+	StreamFlagsHistorical uint32 = 0x08 // OS_ACTIVITY_STREAM_HISTORICAL: replays buffered entries before live ones
+	StreamFlagsDebug      uint32 = 0x20 // triggers mode=0xb → enables Info+Debug together
+	StreamFlagsAll        uint32 = StreamFlagsDebug
 )
 
 func (l LogLevel) String() string {
@@ -230,8 +232,65 @@ type Connection struct {
 // request with the given pid filter, MessageFilter bitmask, and StreamFlags
 // bitmask, and performs the handshake. Use pid=-1 for all processes. See the
 // MessageFilter* and StreamFlags* constants, or build a spec with
-// ParseLevelFilter.
+// ParseLevelFilter. StreamFlagsPayload|StreamFlagsHistorical replays the
+// process's buffered log before streaming new entries.
 func New(device ios.DeviceEntry, pid int, messageFilter uint16, streamFlags uint32) (*Connection, error) {
+	conn, err := connect(device)
+	if err != nil {
+		return nil, err
+	}
+
+	request := map[string]interface{}{
+		"Request":       "StartActivity",
+		"MessageFilter": messageFilter,
+		"Pid":           pid,
+		"StreamFlags":   streamFlags,
+	}
+	response, err := conn.exchange(request)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	status, ok := response["Status"].(string)
+	if !ok || status != "RequestSuccessful" {
+		conn.Close()
+		return nil, fmt.Errorf("ostrace: StartActivity failed, response: %v", response)
+	}
+
+	golog.Debug("ostrace: StartActivity handshake successful", "module", logModule, "pid", pid)
+	return conn, nil
+}
+
+// ProcessList returns the device's running processes as pid → process name,
+// using os_trace_relay's PidList request.
+func ProcessList(device ios.DeviceEntry) (map[int]string, error) {
+	conn, err := connect(device)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	response, err := conn.exchange(map[string]interface{}{"Request": "PidList"})
+	if err != nil {
+		return nil, err
+	}
+	payload, ok := response["Payload"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("ostrace: PidList response has no Payload dictionary: %v", response)
+	}
+	processes := make(map[int]string, len(payload))
+	for key, value := range payload {
+		pid, err := strconv.Atoi(key)
+		if err != nil {
+			return nil, fmt.Errorf("ostrace: PidList Payload key %q is not a pid", key)
+		}
+		info, _ := value.(map[string]interface{})
+		processes[pid], _ = info["ProcessName"].(string)
+	}
+	return processes, nil
+}
+
+func connect(device ios.DeviceEntry) (*Connection, error) {
 	var deviceConn ios.DeviceConnectionInterface
 	var err error
 
@@ -244,72 +303,29 @@ func New(device ios.DeviceEntry, pid int, messageFilter uint16, streamFlags uint
 		return nil, fmt.Errorf("ostrace: failed to connect to service: %w", err)
 	}
 
-	conn := &Connection{
+	return &Connection{
 		closer: deviceConn,
 		reader: deviceConn.Reader(),
 		writer: deviceConn.Writer(),
-	}
-
-	if err := conn.startActivity(pid, messageFilter, streamFlags); err != nil {
-		deviceConn.Close()
-		return nil, err
-	}
-
-	return conn, nil
+	}, nil
 }
 
-// startActivity sends the StartActivity plist request and reads the handshake response.
-func (c *Connection) startActivity(pid int, messageFilter uint16, streamFlags uint32) error {
+// exchange sends a request plist and reads the reply: one marker byte, then a
+// length-prefixed plist.
+func (c *Connection) exchange(request map[string]interface{}) (map[string]interface{}, error) {
 	codec := ios.NewPlistCodecReadWriter(c.reader, c.writer)
-
-	request := map[string]interface{}{
-		"Request":       "StartActivity",
-		"MessageFilter": messageFilter,
-		"Pid":           pid,
-		"StreamFlags":   streamFlags,
-	}
-
 	if err := codec.Write(request); err != nil {
-		return fmt.Errorf("ostrace: failed to send StartActivity request: %w", err)
+		return nil, fmt.Errorf("ostrace: failed to send %v request: %w", request["Request"], err)
 	}
-
-	// Response handshake:
-	// 1. Read 4 bytes LE → lengthLength (number of bytes encoding the plist length)
-	// 2. Read lengthLength bytes → reverse → parse as big-endian int → plistLength
-	// 3. Read plistLength bytes → decode plist → expect {"Status": "RequestSuccessful"}
-	var lengthLength uint32
-	if err := binary.Read(c.reader, binary.LittleEndian, &lengthLength); err != nil {
-		return fmt.Errorf("ostrace: failed to read length-length: %w", err)
+	var marker [1]byte
+	if _, err := io.ReadFull(c.reader, marker[:]); err != nil {
+		return nil, fmt.Errorf("ostrace: failed to read %v response marker: %w", request["Request"], err)
 	}
-
-	lengthBytes := make([]byte, lengthLength)
-	if _, err := io.ReadFull(c.reader, lengthBytes); err != nil {
-		return fmt.Errorf("ostrace: failed to read plist length bytes: %w", err)
+	var response map[string]interface{}
+	if err := codec.Read(&response); err != nil {
+		return nil, fmt.Errorf("ostrace: failed to read %v response: %w", request["Request"], err)
 	}
-
-	// Reverse the bytes and interpret as big-endian integer
-	slices.Reverse(lengthBytes)
-	var plistLength uint64
-	for _, b := range lengthBytes {
-		plistLength = (plistLength << 8) | uint64(b)
-	}
-
-	plistData := make([]byte, plistLength)
-	if _, err := io.ReadFull(c.reader, plistData); err != nil {
-		return fmt.Errorf("ostrace: failed to read response plist: %w", err)
-	}
-
-	response, err := ios.ParsePlist(plistData)
-	if err != nil {
-		return fmt.Errorf("ostrace: failed to parse response plist: %w", err)
-	}
-	status, ok := response["Status"].(string)
-	if !ok || status != "RequestSuccessful" {
-		return fmt.Errorf("ostrace: StartActivity failed, response: %v", response)
-	}
-
-	golog.Debug("ostrace: StartActivity handshake successful", "module", logModule, "pid", pid)
-	return nil
+	return response, nil
 }
 
 // ReadEntry reads a single log entry from the stream. This is a blocking call.
