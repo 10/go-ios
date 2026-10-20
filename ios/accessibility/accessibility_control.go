@@ -74,6 +74,7 @@ const (
 type AXElementData struct {
 	PlatformElementValue string `json:"platformElementValue"` // Base64-encoded platform element data
 	SpokenDescription    string `json:"spokenDescription"`    // Spoken description of the element
+	Identifier           string `json:"identifier,omitempty"` // The element's accessibility identifier, when it has one
 }
 
 func (a *ControlInterface) readhostAppStateChanged(ctx context.Context) {
@@ -258,9 +259,18 @@ func (a *ControlInterface) parseElementResponse(resp map[string]interface{}) (AX
 		return AXElementData{}, err
 	}
 
+	identifier := ""
+	if elementValue, err := getNestedMap(innerValue, "ElementValue_v1"); err == nil {
+		if outer, err := getNestedMap(elementValue, "Value"); err == nil {
+			if inner, err := getNestedMap(outer, "Value"); err == nil {
+				identifier = a.extractStringFromField(inner, "AccessibilityIdentifier_v1")
+			}
+		}
+	}
 	return AXElementData{
 		PlatformElementValue: base64.StdEncoding.EncodeToString(platformElementBytes),
 		SpokenDescription:    spokenDescription,
+		Identifier:           identifier,
 	}, nil
 }
 
