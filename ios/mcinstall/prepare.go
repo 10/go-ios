@@ -138,22 +138,18 @@ func Prepare(device ios.DeviceEntry, skip []string, certBytes []byte, orgname st
 	}
 	defer conn.Close()
 	golog.Info("send flush request", "module", logModule, "udid", device.Properties.SerialNumber)
-	re, err := check(conn.sendAndReceive(request("Flush")))
-	if err != nil {
+	if err := conn.Flush(); err != nil {
 		return err
 	}
-	golog.Debug("flush response", "module", logModule, "udid", device.Properties.SerialNumber, "response", re)
 	golog.Info("get cloud config", "module", logModule, "udid", device.Properties.SerialNumber)
-	config, err := check(conn.sendAndReceive(request("GetCloudConfiguration")))
+	config, err := conn.GetCloudConfiguration()
 	if err != nil {
 		return err
 	}
 	golog.Debug("get first cloudconfig", "module", logModule, "udid", device.Properties.SerialNumber, "config", config)
-	hello, err := check(conn.sendAndReceive(request("HelloHostIdentifier")))
-	if err != nil {
+	if err := conn.HelloHostIdentifier(); err != nil {
 		return err
 	}
-	golog.Debug("hello response", "module", logModule, "udid", device.Properties.SerialNumber, "response", hello)
 
 	cloudConfig := map[string]interface{}{
 		"AllowPairing": true,
@@ -169,29 +165,21 @@ func Prepare(device ios.DeviceEntry, skip []string, certBytes []byte, orgname st
 		cloudConfig["IsMultiUser"] = false
 	}
 
-	setCloudConfig := map[string]interface{}{
-		"CloudConfiguration": cloudConfig,
-		"RequestType":        "SetCloudConfiguration",
+	golog.Debug("set cloud config", "module", logModule, "udid", device.Properties.SerialNumber, "config", cloudConfig)
+	if err := conn.SetCloudConfiguration(cloudConfig); err != nil {
+		return fmt.Errorf("failed setting cloud config: %w", err)
 	}
-	golog.Debug("set cloud config", "module", logModule, "udid", device.Properties.SerialNumber, "config", setCloudConfig)
-	setResp, err := check(conn.sendAndReceive(setCloudConfig))
-	if err != nil {
-		return fmt.Errorf("failed setting cloud config, resp: %v err: %v", setResp, err)
-	}
-	golog.Debug("set response", "module", logModule, "udid", device.Properties.SerialNumber, "response", setResp)
-	hello, err = check(conn.sendAndReceive(request("HelloHostIdentifier")))
-	if err != nil {
+	if err := conn.HelloHostIdentifier(); err != nil {
 		return err
 	}
 	golog.Debug("get cloud config", "module", logModule, "udid", device.Properties.SerialNumber)
-	config, err = check(conn.sendAndReceive(request("GetCloudConfiguration")))
+	config, err = conn.GetCloudConfiguration()
 	if err != nil {
 		return err
 	}
 	golog.Debug("cloud config config", "module", logModule, "udid", device.Properties.SerialNumber, "config", config)
 
-	hello, err = check(conn.sendAndReceive(request("HelloHostIdentifier")))
-	if err != nil {
+	if err := conn.HelloHostIdentifier(); err != nil {
 		return err
 	}
 	err = conn.EscalateUnsupervised()
@@ -199,16 +187,13 @@ func Prepare(device ios.DeviceEntry, skip []string, certBytes []byte, orgname st
 		// the device always throws a CertificateRejected error here, but it works just fine
 		golog.Debug("escalate unsupervised error (expected)", "module", logModule, "udid", device.Properties.SerialNumber, "error", err)
 	}
-	hello, err = check(conn.sendAndReceive(request("HelloHostIdentifier")))
-	if err != nil {
+	if err := conn.HelloHostIdentifier(); err != nil {
 		return err
 	}
-	err = conn.AddProfile([]byte(initialProfile))
-	if err != nil {
+	if err := conn.InstallProfile([]byte(initialProfile)); err != nil {
 		return err
 	}
-	hello, err = check(conn.sendAndReceive(request("HelloHostIdentifier")))
-	if err != nil {
+	if err := conn.HelloHostIdentifier(); err != nil {
 		return err
 	}
 

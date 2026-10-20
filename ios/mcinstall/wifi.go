@@ -30,11 +30,9 @@ func PrepareWifi(device ios.DeviceEntry, ssid string, psw string, encType string
 	}
 	defer conn.Close()
 	golog.Info("send flush request", "module", logModule, "udid", device.Properties.SerialNumber)
-	re, err := check(conn.sendAndReceive(request("Flush")))
-	if err != nil {
+	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("PrepareWifi: flush failed: %w", err)
 	}
-	golog.Debug("flush response", "module", logModule, "udid", device.Properties.SerialNumber, "response", re)
 
 	supervised := isSupervised(conn)
 
@@ -60,7 +58,7 @@ func PrepareWifi(device ios.DeviceEntry, ssid string, psw string, encType string
 		profileUUID(ssid),
 	)
 
-	if err := conn.AddProfile([]byte(profile)); err != nil {
+	if err := conn.InstallProfile([]byte(profile)); err != nil {
 		return fmt.Errorf("PrepareWifi: %w", err)
 	}
 
@@ -90,11 +88,9 @@ func RemoveWifi(device ios.DeviceEntry, ssid string) error {
 	}
 	defer conn.Close()
 	golog.Info("send flush request", "module", logModule, "udid", device.Properties.SerialNumber)
-	re, err := check(conn.sendAndReceive(request("Flush")))
-	if err != nil {
+	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("RemoveWifi: flush failed: %w", err)
 	}
-	golog.Debug("flush response", "module", logModule, "udid", device.Properties.SerialNumber, "response", re)
 
 	supervised := isSupervised(conn)
 

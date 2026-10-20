@@ -1115,7 +1115,7 @@ func handleProfileAdd(device ios.DeviceEntry, file string) {
 	exitIfError("Starting mcInstall failed with", err)
 	filebytes, err := os.ReadFile(file)
 	exitIfError("could not read profile-file", err)
-	err = profileService.AddProfile(filebytes)
+	err = profileService.InstallProfile(filebytes)
 	exitIfError("failed adding profile", err)
 	slog.Info("profile installed, you have to accept it in the device settings")
 }
@@ -1135,7 +1135,7 @@ func handleProfileAddSupervised(device ios.DeviceEntry, file string, p12file str
 func handleProfileList(device ios.DeviceEntry) {
 	profileService, err := mcinstall.New(device)
 	exitIfError("Starting mcInstall failed with", err)
-	list, err := profileService.HandleList()
+	list, err := profileService.ProfileList()
 	exitIfError("failed getting profile list", err)
 	fmt.Println(convertToJSONString(list))
 }

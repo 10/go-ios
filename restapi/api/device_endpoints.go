@@ -323,7 +323,7 @@ func GetProfiles(c *gin.Context) {
 
 	defer mcinstallconn.Close()
 
-	profileInfo, err := mcinstallconn.HandleList()
+	profileInfo, err := mcinstallconn.ProfileList()
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"message": "Failed getting profile list with error", "error": err.Error()})
 		return

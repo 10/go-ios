@@ -4,7 +4,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 
 	"golang.org/x/crypto/pkcs12"
@@ -55,29 +54,20 @@ type ProfileManifest struct {
 	IsActive    bool
 }
 
-func (mcInstallConn *Connection) readExchangeResponse(reader io.Reader) ([]ProfileInfo, error) {
-	responseBytes, err := mcInstallConn.plistCodec.Decode(reader)
-	if err != nil {
-		return []ProfileInfo{}, err
-	}
-
-	dict, err := ios.ParsePlist(responseBytes)
-	if err != nil {
-		return []ProfileInfo{}, err
-	}
+func parseProfileList(dict map[string]interface{}) ([]ProfileInfo, error) {
 	identifiersIntf, ok := dict["OrderedIdentifiers"]
 	if !ok {
-		return []ProfileInfo{}, fmt.Errorf("invalid plist response, missing key 'OrderedIdentifiers' dump: %x", responseBytes)
+		return []ProfileInfo{}, fmt.Errorf("invalid plist response, missing key 'OrderedIdentifiers' dump: %+v", dict)
 	}
 	identifiers, ok := identifiersIntf.([]interface{})
 	if !ok {
-		return []ProfileInfo{}, fmt.Errorf("identifiers should be array, dump: %x", responseBytes)
+		return []ProfileInfo{}, fmt.Errorf("identifiers should be array, dump: %+v", dict)
 	}
 	profiles := make([]ProfileInfo, len(identifiers))
 	for i, id := range identifiers {
 		idString, ok := id.(string)
 		if !ok {
-			return []ProfileInfo{}, fmt.Errorf("identifiers should be array of strings, dump: %x", responseBytes)
+			return []ProfileInfo{}, fmt.Errorf("identifiers should be array of strings, dump: %+v", dict)
 		}
 		profile, err := parseProfile(idString, dict)
 		if err != nil {
@@ -261,18 +251,13 @@ func (mcInstallConn *Connection) sendAndReceive(request map[string]interface{}) 
 	return ios.ParsePlist(responseBytes)
 }
 
-func (mcInstallConn *Connection) HandleList() ([]ProfileInfo, error) {
-	reader := mcInstallConn.deviceConn.Reader()
-	request := map[string]interface{}{"RequestType": "GetProfileList"}
-	requestBytes, err := mcInstallConn.plistCodec.Encode(request)
+// ProfileList returns the configuration profiles installed on the device.
+func (mcInstallConn *Connection) ProfileList() ([]ProfileInfo, error) {
+	response, err := mcInstallConn.sendChecked(request("GetProfileList"))
 	if err != nil {
-		return []ProfileInfo{}, err
+		return nil, err
 	}
-	err = mcInstallConn.deviceConn.Send(requestBytes)
-	if err != nil {
-		return []ProfileInfo{}, err
-	}
-	return mcInstallConn.readExchangeResponse(reader)
+	return parseProfileList(response)
 }
 
 // Close closes the underlying DeviceConnection
@@ -280,30 +265,15 @@ func (mcInstallConn *Connection) Close() error {
 	return mcInstallConn.deviceConn.Close()
 }
 
-func (mcInstallConn *Connection) AddProfile(profilePlist []byte) error {
+// InstallProfile installs a configuration profile with MCInstall's plain
+// InstallProfile request, without escalation.
+func (mcInstallConn *Connection) InstallProfile(profilePlist []byte) error {
 	return mcInstallConn.addProfile(profilePlist, "InstallProfile")
 }
 
 func (mcInstallConn *Connection) addProfile(profilePlist []byte, installcmd string) error {
-	request := map[string]interface{}{"RequestType": installcmd, "Payload": profilePlist}
-	requestBytes, err := mcInstallConn.plistCodec.Encode(request)
-	if err != nil {
-		return err
-	}
-	err = mcInstallConn.deviceConn.Send(requestBytes)
-	if err != nil {
-		return err
-	}
-	respBytes, err := mcInstallConn.plistCodec.Decode(mcInstallConn.deviceConn.Reader())
-	if err != nil {
-		return err
-	}
-	plist, err := ios.ParsePlist(respBytes)
-	if checkStatus(plist) {
-		return nil
-	}
-	golog.Error("received add response", "module", logModule, "installcmd", installcmd, "response", plist)
-	return fmt.Errorf("add failed")
+	_, err := mcInstallConn.sendChecked(map[string]interface{}{"RequestType": installcmd, "Payload": profilePlist})
+	return err
 }
 
 func (mcInstallConn *Connection) RemoveProfile(identifier string) error {
@@ -411,10 +381,44 @@ func (mcInstallConn *Connection) SetWallpaperSupervised(image []byte, screen Wal
 	return mcInstallConn.SetWallpaper(image, screen)
 }
 
-// GetCloudConfiguration retrieves the cloud configuration from the device.
-// This includes settings like SkipSetup options, supervision status, and organization info.
+// Flush sends MCInstall's Flush request, the first request of a session.
+func (mcInstallConn *Connection) Flush() error {
+	_, err := mcInstallConn.sendChecked(request("Flush"))
+	return err
+}
+
+// HelloHostIdentifier sends MCInstall's HelloHostIdentifier request, which
+// identifies this host to the device.
+func (mcInstallConn *Connection) HelloHostIdentifier() error {
+	_, err := mcInstallConn.sendChecked(request("HelloHostIdentifier"))
+	return err
+}
+
+// GetCloudConfiguration returns the device's cloud configuration: SkipSetup
+// options, supervision status and organization info. It returns nil when the
+// device has none.
 func (mcInstallConn *Connection) GetCloudConfiguration() (map[string]interface{}, error) {
-	return mcInstallConn.sendAndReceive(request("GetCloudConfiguration"))
+	response, err := mcInstallConn.sendChecked(request("GetCloudConfiguration"))
+	if err != nil {
+		return nil, err
+	}
+	config, _ := response["CloudConfiguration"].(map[string]interface{})
+	return config, nil
+}
+
+// CodeCloudConfigurationPresent is the Error code of a SetCloudConfiguration
+// refused because the device already has a cloud configuration. Only an erase
+// clears it.
+const CodeCloudConfigurationPresent = 14002
+
+// SetCloudConfiguration sets the cloud configuration Setup Assistant applies,
+// such as SkipSetup, AllowPairing and supervision.
+func (mcInstallConn *Connection) SetCloudConfiguration(config map[string]any) error {
+	_, err := mcInstallConn.sendChecked(map[string]interface{}{
+		"RequestType":        "SetCloudConfiguration",
+		"CloudConfiguration": config,
+	})
+	return err
 }
 
 // ErrPasscodeSet reports that the device already has a passcode, so the keybag refuses
@@ -442,31 +446,62 @@ func errorCode(entry map[string]interface{}) int64 {
 	return 0
 }
 
-// describeFailure renders the actionable part of a rejected MCInstall response: the
-// status plus each ErrorChain entry's domain, code and description.
+// Error is an MCInstall request the device refused. Domain, Code and
+// Description are the first entry of Apple's ErrorChain; Unwrap returns the
+// next entry, its cause, as another *Error.
+type Error struct {
+	Request     string
+	Status      string
+	Domain      string
+	Code        int
+	Description string
+	cause       *Error
+}
+
+// Error lists the status and every ErrorChain entry.
+func (e *Error) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s failed: Status=%s", e.Request, e.Status)
+	for entry := e; entry != nil && entry.Domain != ""; entry = entry.cause {
+		fmt.Fprintf(&b, "; %s(%d): %s", entry.Domain, entry.Code, entry.Description)
+	}
+	return b.String()
+}
+
+// Unwrap returns the next ErrorChain entry, or nil.
+func (e *Error) Unwrap() error {
+	if e.cause == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// newError builds the Error for a refused response from its status and ErrorChain only.
 //
-// It deliberately never formats the whole response. RequestUnlockToken responses carry
+// It deliberately never reads the rest of the response. RequestUnlockToken responses carry
 // the unlock token, and ClearPasscode responses commonly echo the UnlockToken that was
 // sent, so dumping them would write the token to every log sink the error reaches --
 // defeating the 0o600 permissions the token file is otherwise protected with.
-func describeFailure(response map[string]interface{}) string {
+func newError(requestType string, response map[string]interface{}) *Error {
 	status, _ := response["Status"].(string)
 	if status == "" {
 		status = "unknown"
 	}
-	parts := []string{"Status=" + status}
-	if chain, ok := response["ErrorChain"].([]interface{}); ok {
-		for _, entry := range chain {
-			errorMap, ok := entry.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			domain, _ := errorMap["ErrorDomain"].(string)
-			description, _ := errorMap["LocalizedDescription"].(string)
-			parts = append(parts, fmt.Sprintf("%s(%d): %s", domain, errorCode(errorMap), description))
+	var err *Error
+	chain, _ := response["ErrorChain"].([]interface{})
+	for i := len(chain) - 1; i >= 0; i-- {
+		errorMap, ok := chain[i].(map[string]interface{})
+		if !ok {
+			continue
 		}
+		domain, _ := errorMap["ErrorDomain"].(string)
+		description, _ := errorMap["LocalizedDescription"].(string)
+		err = &Error{Request: requestType, Status: status, Domain: domain, Code: int(errorCode(errorMap)), Description: description, cause: err}
 	}
-	return strings.Join(parts, "; ")
+	if err == nil {
+		return &Error{Request: requestType, Status: status}
+	}
+	return err
 }
 
 // hasErrorCode reports whether the response's ErrorChain contains the given domain and code.
@@ -487,15 +522,16 @@ func hasErrorCode(response map[string]interface{}, domain string, code int64) bo
 	return false
 }
 
-// sendChecked sends request and verifies the device acknowledged it. On rejection the
-// returned error carries only the redacted description, never the raw response.
-func (mcInstallConn *Connection) sendChecked(request map[string]interface{}, name string) (map[string]interface{}, error) {
+// sendChecked sends request and verifies the device acknowledged it. On rejection it
+// returns the response with an *Error.
+func (mcInstallConn *Connection) sendChecked(request map[string]interface{}) (map[string]interface{}, error) {
 	response, err := mcInstallConn.sendAndReceive(request)
 	if err != nil {
 		return nil, err
 	}
 	if !checkStatus(response) {
-		return response, fmt.Errorf("%s failed: %s", name, describeFailure(response))
+		requestType, _ := request["RequestType"].(string)
+		return response, newError(requestType, response)
 	}
 	return response, nil
 }
@@ -505,7 +541,7 @@ func (mcInstallConn *Connection) sendChecked(request map[string]interface{}, nam
 // keybag rejects the request and this returns an error wrapping ErrPasscodeSet
 // (DMCKeybagErrorDomain code 37002).
 func (mcInstallConn *Connection) FetchUnlockToken() ([]byte, error) {
-	response, err := mcInstallConn.sendChecked(request("RequestUnlockToken"), "RequestUnlockToken")
+	response, err := mcInstallConn.sendChecked(request("RequestUnlockToken"))
 	if err != nil {
 		if hasErrorCode(response, keybagErrorDomain, keybagErrPasscodeSet) {
 			return nil, fmt.Errorf("%w: %v", ErrPasscodeSet, err)
@@ -524,7 +560,7 @@ func (mcInstallConn *Connection) FetchUnlockToken() ([]byte, error) {
 // encryption capabilities and management status. It is a read-only query and performs no
 // keybag operation.
 func (mcInstallConn *Connection) SecurityInfo() (map[string]interface{}, error) {
-	response, err := mcInstallConn.sendChecked(request("SecurityInfo"), "SecurityInfo")
+	response, err := mcInstallConn.sendChecked(request("SecurityInfo"))
 	if err != nil {
 		return nil, err
 	}
@@ -561,13 +597,13 @@ func (mcInstallConn *Connection) ClearPasscode(unlockToken []byte) error {
 	_, err := mcInstallConn.sendChecked(map[string]interface{}{
 		"RequestType": "ClearPasscode",
 		"UnlockToken": unlockToken,
-	}, "ClearPasscode")
+	})
 	return err
 }
 
 // ClearScreenTimePassword clears the Screen Time restrictions passcode on an
 // already-escalated MCInstall connection. No unlock token is required.
 func (mcInstallConn *Connection) ClearScreenTimePassword() error {
-	_, err := mcInstallConn.sendChecked(request("ClearRestrictionsPassword"), "ClearRestrictionsPassword")
+	_, err := mcInstallConn.sendChecked(request("ClearRestrictionsPassword"))
 	return err
 }

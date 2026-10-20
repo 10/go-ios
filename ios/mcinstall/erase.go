@@ -1,7 +1,6 @@
 package mcinstall
 
 import (
-	"fmt"
 	"io"
 
 	"github.com/danielpaulus/go-ios/ios"
@@ -18,12 +17,11 @@ func Erase(device ios.DeviceEntry) error {
 	defer conn.Close()
 	golog.Info("start erasing", "module", logModule, "udid", device.Properties.SerialNumber)
 	golog.Debug("send flush request", "module", logModule, "udid", device.Properties.SerialNumber)
-	_, err = check(conn.sendAndReceive(request("Flush")))
-	if err != nil {
+	if err := conn.Flush(); err != nil {
 		return err
 	}
 	golog.Debug("get cloud config", "module", logModule, "udid", device.Properties.SerialNumber)
-	config, err := check(conn.sendAndReceive(request("GetCloudConfiguration")))
+	config, err := conn.GetCloudConfiguration()
 	if err != nil {
 		return err
 	}
@@ -34,20 +32,10 @@ func Erase(device ios.DeviceEntry) error {
 		"RequestType":      "EraseDevice",
 		"PreserveDataPlan": 1,
 	}
-	_, err = check(conn.sendAndReceive(eraseRequest))
+	_, err = conn.sendChecked(eraseRequest)
 	if err != nil && err != io.EOF {
 		return err
 	}
 	golog.Info("device should be rebooting now", "module", logModule, "udid", device.Properties.SerialNumber)
 	return nil
-}
-
-func check(request map[string]interface{}, err error) (map[string]interface{}, error) {
-	if err != nil {
-		return map[string]interface{}{}, err
-	}
-	if !checkStatus(request) {
-		return map[string]interface{}{}, fmt.Errorf("failed command: %v", request)
-	}
-	return request, nil
 }
