@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -45,7 +46,8 @@ func createIoCloser(rw1, rw2 io.ReadWriteCloser) ioResourceCloser {
 // Set it up with the Init method and provide a io.ReadWriter to a IP/TUN compatible device.
 // If EnableSniffer, raw TCP packets will be dumped to the console.
 type UserSpaceTUNInterface struct {
-	nicID tcpip.NICID
+	nicID        tcpip.NICID
+	localAddress tcpip.Address
 	//If EnableSniffer, raw TCP packets will be dumped to the console.
 	EnableSniffer bool
 	networkStack  *stack.Stack
@@ -144,13 +146,14 @@ func (iface *UserSpaceTUNInterface) Init(mtu uint32, connToTUNIface io.ReadWrite
 		return fmt.Errorf("Init: invalid tunnel IP address %q", ipAddrString)
 	}
 	addr := tcpip.AddrFromSlice(parsedIP.To16())
+	iface.localAddress = addr
 	addrWithPrefix := addr.WithPrefix()
 	addrWithPrefix.PrefixLen = prefixLength
 
 	//Create a new stack, ipv6 is enough for ios devices
 	iface.networkStack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv6.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 
 	// connToTUNIface needs to be connection that understands IP packets,
@@ -189,6 +192,27 @@ func (iface *UserSpaceTUNInterface) Init(mtu uint32, connToTUNIface io.ReadWrite
 	return nil
 }
 
+// udpReceiveBuffer gives a UDP socket room for a burst of video between reads,
+// above gVisor's 212 KiB default. A dropped RTP packet damages every later frame.
+const udpReceiveBuffer = 1 << 20
+
+func (iface *UserSpaceTUNInterface) listenUDP() (net.PacketConn, error) {
+	var wq waiter.Queue
+	ep, err := iface.networkStack.NewEndpoint(udp.ProtocolNumber, ipv6.ProtocolNumber, &wq)
+	if err != nil {
+		return nil, fmt.Errorf("listenUDP: NewEndpoint failed: %s", err)
+	}
+	ep.SocketOptions().SetReceiveBufferSize(udpReceiveBuffer, false)
+	if err := ep.Bind(tcpip.FullAddress{NIC: iface.nicID, Addr: iface.localAddress}); err != nil {
+		ep.Close()
+		return nil, fmt.Errorf("listenUDP: Bind failed: %s", err)
+	}
+	return gonet.NewUDPConn(&wq, ep), nil
+}
+
+// ConnectUserSpaceTunnelLockdown starts a userspace tunnel to the device over
+// lockdown, serving it on localhost:ifacePort. With ifacePort 0 a free port is
+// picked; the Tunnel's UserspaceTUNPort reports it.
 func ConnectUserSpaceTunnelLockdown(device ios.DeviceEntry, ifacePort int) (Tunnel, error) {
 	conn, err := ios.ConnectToService(device, coreDeviceProxy)
 	if err != nil {
@@ -264,10 +288,13 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
 		return doClose()
 	}
 	return Tunnel{
-		Address: tunnelInfo.ServerAddress,
-		RsdPort: int(tunnelInfo.ServerRSDPort),
-		Udid:    device.Properties.SerialNumber,
-		closer:  closeFunc,
+		Address:          tunnelInfo.ServerAddress,
+		RsdPort:          int(tunnelInfo.ServerRSDPort),
+		Udid:             device.Properties.SerialNumber,
+		UserspaceTUN:     true,
+		UserspaceTUNPort: listener.Addr().(*net.TCPAddr).Port,
+		userspace:        &iface,
+		closer:           closeFunc,
 	}, nil
 }
 

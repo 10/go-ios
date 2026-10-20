@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -37,12 +38,24 @@ type Tunnel struct {
 	// Userspace TUN device is used, connect to the local tcp port at Default
 	UserspaceTUN     bool `json:"userspaceTun"`
 	UserspaceTUNPort int  `json:"userspaceTunPort"`
+	userspace        *UserSpaceTUNInterface
 	closer           func() error
 }
 
 // Close closes the connection to the device and removes the virtual network interface from the host
 func (t Tunnel) Close() error {
 	return t.closer()
+}
+
+// ListenUDP opens a UDP socket on this end's address inside a userspace tunnel
+// started in this process, on a port the tunnel picks. The device reaches it
+// at that address and port, and datagrams written to it go to the device. A
+// kernel tunnel returns an error: bind on the host's tunnel interface instead.
+func (t Tunnel) ListenUDP() (net.PacketConn, error) {
+	if t.userspace == nil {
+		return nil, errors.New("ListenUDP: not a userspace tunnel started in this process")
+	}
+	return t.userspace.listenUDP()
 }
 
 // ManualPairAndConnectToTunnel tries to verify an existing pairing, and if this fails it triggers a new manual pairing process.

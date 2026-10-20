@@ -593,10 +593,7 @@ func (m manualPairingTunnelStart) StartTunnel(ctx context.Context, device ios.De
 
 	if version.GreaterThan(semver.MustParse("17.4.0")) {
 		if userspaceTUN {
-			tun, err := ConnectUserSpaceTunnelLockdown(device, device.UserspaceTUNPort)
-			tun.UserspaceTUN = true
-			tun.UserspaceTUNPort = device.UserspaceTUNPort
-			return tun, err
+			return ConnectUserSpaceTunnelLockdown(device, device.UserspaceTUNPort)
 		}
 		return ConnectTunnelLockdown(device)
 	}
