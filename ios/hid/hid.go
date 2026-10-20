@@ -1,6 +1,7 @@
-// Package hid injects touch events over CoreDevice. A media stream has to be
-// running for the device to apply them, and starting one is the caller's job:
-// without it every report is accepted and discarded with no error. iOS 27+.
+// Package hid injects touch, keyboard and Home button events over CoreDevice.
+// A media stream has to be running for the device to apply them, and starting
+// one is the caller's job: without it every report is accepted and discarded
+// with no error. iOS 27+.
 package hid
 
 import (
@@ -14,6 +15,10 @@ const (
 	universalServiceName = "com.apple.coredevice.hid.universalhidservice"
 
 	universalFeatureIdentifier = "com.apple.coredevice.feature.remote.universalhidservice"
+
+	buttonServiceName = "com.apple.coredevice.hid.indigo"
+
+	buttonFeatureIdentifier = "com.apple.coredevice.feature.remote.hid.button"
 )
 
 // surfaceMainTouchscreen is the service id the device gives its built in

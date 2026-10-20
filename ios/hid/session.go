@@ -3,9 +3,11 @@ package hid
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/danielpaulus/go-ios/ios"
 	"github.com/danielpaulus/go-ios/ios/golog"
+	"github.com/danielpaulus/go-ios/ios/xpc"
 )
 
 const logModule = "go-ios/hid"
@@ -24,7 +26,7 @@ type hidConn interface {
 	Close() error
 }
 
-// Session delivers touch input to one device.
+// Session delivers touch input and the Home button to one device.
 //
 // A media stream has to be running for any of this to reach the screen. Without
 // one the device accepts every report and discards it, returning no error, so a
@@ -37,6 +39,8 @@ type Session struct {
 	mutex sync.Mutex
 	hid   hidConn
 
+	buttons *xpc.Connection
+
 	// Tracks a contact held by the Touch* methods, so closing mid-gesture lifts it
 	// rather than leaving the device believing a finger is down.
 	contactDown bool
@@ -45,7 +49,7 @@ type Session struct {
 	closed bool
 }
 
-// NewSession connects to the device's HID service. iOS 27+ and a kernel tunnel.
+// NewSession connects to the device's HID service. iOS 27+.
 //
 // Touch does nothing until a media stream is running: the device accepts the
 // reports and throws them away, returning no error. Starting that stream and
@@ -117,11 +121,52 @@ func (s *Session) Close() error {
 		s.contactDown = false
 	}
 
+	if s.buttons != nil {
+		_ = s.buttons.Close()
+		s.buttons = nil
+	}
 	if s.hid != nil {
 		if err := s.hid.Close(); err != nil {
 			return fmt.Errorf("Session.Close: %w", err)
 		}
 		s.hid = nil
+	}
+	return nil
+}
+
+const (
+	// The Home button is the Consumer page's Menu usage.
+	consumerPage = 0x0C
+	menuUsage    = 0x40
+	buttonDown   = 1
+	buttonUp     = 2
+	buttonHold   = 60 * time.Millisecond
+)
+
+// PressHome presses the Home button: down, held 60 ms, then up. On a Face ID
+// iPhone it goes home as a swipe up would.
+func (s *Session) PressHome() error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	if s.buttons == nil {
+		conn, err := ios.ConnectToXpcServiceTunnelIface(s.device, buttonServiceName)
+		if err != nil {
+			return fmt.Errorf("PressHome: %w", err)
+		}
+		s.buttons = conn
+	}
+	for _, state := range []uint64{buttonDown, buttonUp} {
+		if state == buttonUp {
+			time.Sleep(buttonHold)
+		}
+		if err := s.buttons.Send(buildButtonPayload(state, consumerPage, menuUsage)); err != nil {
+			_ = s.buttons.Close()
+			s.buttons = nil
+			return fmt.Errorf("PressHome: %w", err)
+		}
 	}
 	return nil
 }
